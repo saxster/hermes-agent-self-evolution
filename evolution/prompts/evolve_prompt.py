@@ -52,13 +52,24 @@ console = Console()
 # ── Prompt-specific fitness metric ──────────────────────────────────────────
 
 
-def prompt_section_fitness(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
+def prompt_section_fitness(
+    example: dspy.Example,
+    prediction: dspy.Prediction,
+    trace=None,
+    pred_name=None,
+    pred_trace=None,
+) -> float:
     """DSPy-compatible metric for prompt section optimization.
 
     Scores whether the agent's response (guided by the prompt section)
     exhibits the desired behavior. Uses keyword overlap as a fast proxy,
     same approach as skill_fitness_metric but with additional checks for
     behavioral compliance.
+
+    Accepts the GEPA 5-arg signature ``(gold, pred, trace, pred_name,
+    pred_trace)`` as well as the MIPROv2 3-arg signature via default
+    ``None`` values. ``pred_name`` and ``pred_trace`` are ignored here
+    — the fitness is computed only from ``example`` and ``prediction``.
     """
     agent_output = getattr(prediction, "output", "") or ""
     expected = getattr(example, "expected_behavior", "") or ""
@@ -125,8 +136,11 @@ def validate_prompt_section(
         max_tool_desc_size=config.max_tool_desc_size,
     )
     validator = ConstraintValidator(conservative_config)
+    # NOTE: pass "prompt_section" (not "skill") so the YAML-frontmatter /
+    # skill_structure check doesn't fire on prompt sections. Prompt sections
+    # are plain strings with no name/description header.
     results.extend(validator.validate_all(
-        section_text, "skill", baseline_text=baseline_text,
+        section_text, "prompt_section", baseline_text=baseline_text,
     ))
 
     # Check for prompt injection patterns
@@ -394,17 +408,38 @@ def evolve(
 
     try:
         try:
+            # GEPA signature: (metric, *, max_full_evals, reflection_lm, ...)
+            # `iterations` CLI arg maps most naturally to max_full_evals — each full
+            # eval runs the entire trainset once. `reflection_lm` is REQUIRED — GEPA
+            # needs a strong model to reflect on candidates and propose new ones.
+            # `optimizer_model` in EvolutionConfig is explicitly for this purpose.
+            # The metric fitness functions accept GEPA's 5-arg signature via
+            # pred_name/pred_trace defaulting to None.
+            reflection_lm = dspy.LM(optimizer_model)
             optimizer = dspy.GEPA(
                 metric=metric_fn,
-                max_steps=iterations,
+                max_full_evals=iterations,
+                reflection_lm=reflection_lm,
             )
             optimized_module = optimizer.compile(
                 baseline_module,
                 trainset=trainset,
                 valset=valset,
             )
+            console.print(f"[dim]  Optimizer: dspy.GEPA (max_full_evals={iterations}, reflection_lm={optimizer_model})[/dim]")
         except Exception as e:
-            console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+            # IMPORTANT: the fallback is an error-recovery path, not the happy path.
+            # If you see this message, check the error — it's likely a version-skew
+            # or signature change in dspy.GEPA, not "GEPA not available."
+            console.print(
+                f"[yellow]⚠ dspy.GEPA failed ({type(e).__name__}: {e}), "
+                f"falling back to dspy.MIPROv2[/yellow]"
+            )
+            console.print(
+                "[yellow]  Note: MIPROv2 tunes predictor instructions/few-shot,\n"
+                "  not the section_text itself — meta-harness iteration counter\n"
+                "  will not advance in this fallback path.[/yellow]"
+            )
             optimizer = dspy.MIPROv2(
                 metric=metric_fn,
                 auto="light",

@@ -49,11 +49,21 @@ console = Console()
 # ── Fitness metric for tool description optimization ────────────────────────
 
 
-def tool_selection_fitness(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
+def tool_selection_fitness(
+    example: dspy.Example,
+    prediction: dspy.Prediction,
+    trace=None,
+    pred_name=None,
+    pred_trace=None,
+) -> float:
     """DSPy-compatible metric for tool description optimization.
 
     Scores whether the model's tool selection reasoning correctly identifies
     the target tool as the right choice (or correctly rejects it).
+
+    Accepts the GEPA 5-arg signature ``(gold, pred, trace, pred_name,
+    pred_trace)`` as well as the MIPROv2 3-arg signature via default
+    ``None`` values.
 
     The example should have:
       - task_input: the user's request
@@ -397,17 +407,28 @@ def evolve(
 
     try:
         try:
+            reflection_lm = dspy.LM(optimizer_model)
             optimizer = dspy.GEPA(
                 metric=metric_fn,
-                max_steps=iterations,
+                max_full_evals=iterations,
+                reflection_lm=reflection_lm,
             )
             optimized_module = optimizer.compile(
                 baseline_module,
                 trainset=trainset,
                 valset=valset,
             )
+            console.print(f"[dim]  Optimizer: dspy.GEPA (max_full_evals={iterations}, reflection_lm={optimizer_model})[/dim]")
         except Exception as e:
-            console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+            console.print(
+                f"[yellow]⚠ dspy.GEPA failed ({type(e).__name__}: {e}), "
+                f"falling back to dspy.MIPROv2[/yellow]"
+            )
+            console.print(
+                "[yellow]  Note: MIPROv2 tunes predictor instructions/few-shot,\n"
+                "  not the description_text itself — meta-harness iteration\n"
+                "  counter will not advance in this fallback path.[/yellow]"
+            )
             optimizer = dspy.MIPROv2(
                 metric=metric_fn,
                 auto="light",

@@ -8,6 +8,7 @@ C) Golden sets — hand-curated JSONL files
 
 import json
 import random
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -15,6 +16,81 @@ from typing import Optional
 import dspy
 
 from evolution.core.config import EvolutionConfig
+
+
+def _extract_json_array(text: str) -> Optional[list]:
+    """Robustly extract a JSON array from a possibly-messy LLM response.
+
+    Tries, in order:
+      1. Direct `json.loads` on the whole string
+      2. Stripping ```json ... ``` or ``` ... ``` fences
+      3. Greedy match on the outermost `[...]` block
+      4. Per-object recovery: find every `{...}` that parses as dict
+
+    Returns the parsed list, or None if nothing worked.
+    """
+    if not text or not text.strip():
+        return None
+
+    # 1. Raw parse
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            # Sometimes the LLM returns {"test_cases": [...]}
+            for key in ("test_cases", "cases", "examples", "items"):
+                if key in parsed and isinstance(parsed[key], list):
+                    return parsed[key]
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip markdown fences
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence_match:
+        inner = fence_match.group(1).strip()
+        try:
+            parsed = json.loads(inner)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for key in ("test_cases", "cases", "examples", "items"):
+                    if key in parsed and isinstance(parsed[key], list):
+                        return parsed[key]
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Greedy outermost [...]
+    array_match = re.search(r"\[.*\]", text, re.DOTALL)
+    if array_match:
+        try:
+            parsed = json.loads(array_match.group())
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Per-object recovery — scan for every {...} block that parses
+    recovered: list = []
+    depth = 0
+    start: Optional[int] = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict):
+                        recovered.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return recovered if recovered else None
 
 
 @dataclass
@@ -132,17 +208,16 @@ class SyntheticDatasetBuilder:
                 num_cases=n,
             )
 
-        # Parse the generated test cases
-        try:
-            cases_raw = json.loads(result.test_cases)
-        except json.JSONDecodeError:
-            # Try to extract JSON from the response
-            import re
-            match = re.search(r'\[.*\]', result.test_cases, re.DOTALL)
-            if match:
-                cases_raw = json.loads(match.group())
-            else:
-                raise ValueError(f"Could not parse test cases from LLM output: {result.test_cases[:200]}")
+        # Parse the generated test cases. LLMs frequently wrap JSON in markdown
+        # fences or add preamble/trailing prose — handle all of those before
+        # giving up. Order of attempts: raw parse → strip fences → greedy array
+        # match → partial-array recovery.
+        cases_raw = _extract_json_array(result.test_cases)
+        if cases_raw is None:
+            raise ValueError(
+                f"Could not parse test cases from LLM output (first 500 chars): "
+                f"{result.test_cases[:500]}"
+            )
 
         examples = [
             EvalExample(
