@@ -228,6 +228,7 @@ class ToolDescModule(dspy.Module):
         reasoning and state your selection decision.
         """
         tool_description: str = dspy.InputField(desc="The tool's description text")
+        prior_lessons: str = dspy.InputField(desc="Failure patterns and description-writing guidance distilled from prior GEPA iterations (may be empty on the first iteration).")
         task_input: str = dspy.InputField(desc="The user's task or request")
         available_tools: str = dspy.InputField(desc="Comma-separated list of all available tool names")
         output: str = dspy.OutputField(desc="Your tool selection decision and reasoning")
@@ -238,8 +239,24 @@ class ToolDescModule(dspy.Module):
         self.predictor = dspy.ChainOfThought(self.ToolSelection)
 
     def forward(self, task_input: str, available_tools: str = "") -> dspy.Prediction:
+        # Meta-harness hook: if a trace writer is active, tell it which
+        # candidate description produced this prediction. No-op otherwise.
+        prior_lessons = ""
+        try:
+            from evolution.meta_harness.trace_writer import (
+                get_active_writer,
+                get_active_lessons,
+            )
+            _writer = get_active_writer()
+            if _writer is not None:
+                _writer.set_candidate(self.description_text)
+            prior_lessons = get_active_lessons()
+        except Exception:  # pragma: no cover — never block optimization
+            prior_lessons = ""
+
         result = self.predictor(
             tool_description=self.description_text,
+            prior_lessons=prior_lessons,
             task_input=task_input,
             available_tools=available_tools,
         )

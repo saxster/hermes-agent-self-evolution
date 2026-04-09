@@ -219,6 +219,7 @@ class PromptSectionModule(dspy.Module):
         complete the task.
         """
         system_guidance: str = dspy.InputField(desc="The system prompt section providing behavioral guidance")
+        prior_lessons: str = dspy.InputField(desc="Failure patterns and candidate guidance distilled from prior GEPA iterations (may be empty on the first iteration). Use this to avoid repeating mistakes and to build on what has worked.")
         task_input: str = dspy.InputField(desc="The task to complete")
         output: str = dspy.OutputField(desc="Your response following the system guidance")
 
@@ -228,8 +229,24 @@ class PromptSectionModule(dspy.Module):
         self.predictor = dspy.ChainOfThought(self.TaskWithPromptSection)
 
     def forward(self, task_input: str) -> dspy.Prediction:
+        # Meta-harness hook: if a trace writer is active, tell it which
+        # candidate text produced this prediction. Cheap no-op otherwise.
+        prior_lessons = ""
+        try:
+            from evolution.meta_harness.trace_writer import (
+                get_active_writer,
+                get_active_lessons,
+            )
+            _writer = get_active_writer()
+            if _writer is not None:
+                _writer.set_candidate(self.section_text)
+            prior_lessons = get_active_lessons()
+        except Exception:  # pragma: no cover — never block optimization
+            prior_lessons = ""
+
         result = self.predictor(
             system_guidance=self.section_text,
+            prior_lessons=prior_lessons,
             task_input=task_input,
         )
         return dspy.Prediction(output=result.output)

@@ -36,6 +36,15 @@ from evolution.prompts.prompt_module import (
     reassemble_prompt,
     SECTION_CONSTANTS,
 )
+from evolution.meta_harness.trace_writer import (
+    TraceWriter,
+    make_tracing_metric,
+    set_active_writer,
+    tracing_enabled,
+    load_lessons_from_path,
+    set_active_lessons,
+)
+from evolution.meta_harness.diagnose import DiagnosisAgent
 
 console = Console()
 
@@ -310,31 +319,106 @@ def evolve(
     trainset = dataset.to_dspy_examples("train")
     valset = dataset.to_dspy_examples("val")
 
+    # ── Meta-harness tracing (opt-in via HERMES_EVOLUTION_TRACING=1) ────
+    # Create the output directory NOW (instead of post-run at step 10) so
+    # the trace writer can stream per-task traces into it as GEPA runs.
+    # This is the archive the Phase C diagnosis agent reads.
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path("output") / "prompts" / section_name / run_timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir = output_dir / "traces"
+
+    # Always start with empty lessons — any stale value from a prior run
+    # in the same process would poison this one.
+    set_active_lessons("")
+
+    trace_writer: Optional[TraceWriter] = None
+    if tracing_enabled() or config.enable_filesystem_proposer:
+        trace_writer = TraceWriter(
+            archive_dir,
+            artifact_name=section_name,
+        )
+        set_active_writer(trace_writer)
+        console.print(f"  [dim]Meta-harness tracing: ON → {archive_dir}[/dim]")
+
+    # Phase D callback: run the diagnosis agent between iterations and
+    # install the lessons it writes as `prior_lessons` for the next pass.
+    diagnosis_cb = None
+    if config.enable_filesystem_proposer:
+        def diagnosis_cb(iteration_num: int):  # noqa: E306
+            if (iteration_num + 1) % max(1, config.diagnosis_interval) != 0:
+                return
+            if not archive_dir.exists():
+                return
+            console.print(
+                f"  [dim]Meta-harness: running diagnosis after iteration {iteration_num}...[/dim]"
+            )
+            try:
+                agent = DiagnosisAgent(
+                    archive_dir=archive_dir,
+                    model_name=config.diagnosis_model,
+                    max_turns=config.diagnosis_max_turns,
+                    max_cost_usd=config.max_diagnosis_budget_usd,
+                )
+                diag_result = agent.run()
+                if diag_result.lessons_path is not None:
+                    lessons_text = load_lessons_from_path(diag_result.lessons_path)
+                    console.print(
+                        f"  [dim]Diagnosis: wrote {len(lessons_text)} chars of lessons "
+                        f"in {diag_result.turns_used} turns "
+                        f"(${diag_result.total_cost_usd:.3f})[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"  [yellow]Diagnosis: no lessons written "
+                        f"({diag_result.stop_reason}, ${diag_result.total_cost_usd:.3f})[/yellow]"
+                    )
+            except Exception as diag_exc:  # noqa: BLE001
+                console.print(f"  [yellow]Diagnosis failed: {diag_exc}[/yellow]")
+        console.print(
+            f"  [dim]Meta-harness filesystem proposer: ON "
+            f"(diagnosis={config.diagnosis_model}, "
+            f"budget=${config.max_diagnosis_budget_usd:.2f})[/dim]"
+        )
+
+    metric_fn = (
+        make_tracing_metric(prompt_section_fitness, on_iteration_complete=diagnosis_cb)
+        if trace_writer
+        else prompt_section_fitness
+    )
+
     # ── 5. Run GEPA optimization ────────────────────────────────────────
     console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
 
     start_time = time.time()
 
     try:
-        optimizer = dspy.GEPA(
-            metric=prompt_section_fitness,
-            max_steps=iterations,
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=prompt_section_fitness,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+        try:
+            optimizer = dspy.GEPA(
+                metric=metric_fn,
+                max_steps=iterations,
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+                valset=valset,
+            )
+        except Exception as e:
+            console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+            optimizer = dspy.MIPROv2(
+                metric=metric_fn,
+                auto="light",
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+            )
+    finally:
+        # Always clear the active writer AND lessons so the next run
+        # starts clean — the module-level lessons would otherwise leak.
+        if trace_writer is not None:
+            set_active_writer(None)
+        set_active_lessons("")
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -413,10 +497,8 @@ def evolve(
     console.print(table)
 
     # ── 10. Save output ─────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("output") / "prompts" / section_name / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    # output_dir was created before GEPA ran so the trace writer could
+    # stream into it; reuse the same directory here.
     (output_dir / "evolved_section.txt").write_text(evolved_text)
     (output_dir / "baseline_section.txt").write_text(original_text)
 
@@ -424,7 +506,7 @@ def evolve(
         "section_name": section_name,
         "var_name": section["var_name"],
         "source_type": section["source"],
-        "timestamp": timestamp,
+        "timestamp": run_timestamp,
         "iterations": iterations,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,

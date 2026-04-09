@@ -39,6 +39,22 @@ class EvolutionConfig:
     run_tblite: bool = False  # Expensive — opt-in
     tblite_regression_threshold: float = 0.02  # Max 2% regression allowed
 
+    # Meta-harness filesystem proposer (Phases A–D)
+    # When enabled, a diagnosis agent runs between GEPA iterations,
+    # reads the on-disk archive (candidate + traces + scores), and
+    # writes a lessons.md file that the next iteration's proposer
+    # reads as extra context. Default OFF — opt-in feature flag.
+    # Env override: HERMES_FILESYSTEM_PROPOSER=1 turns it on for a
+    # single subprocess invocation (used by the A/B test runner).
+    enable_filesystem_proposer: bool = field(
+        default_factory=lambda: os.getenv("HERMES_FILESYSTEM_PROPOSER", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    diagnosis_model: str = "openai/gpt-4.1-mini"  # cheap model for diagnosis
+    max_diagnosis_budget_usd: float = 0.50        # hard cap per GEPA run
+    diagnosis_max_turns: int = 15                 # tool-call budget per diagnosis run
+    diagnosis_interval: int = 1                   # run diagnosis every N iterations
+
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
     create_pr: bool = True
