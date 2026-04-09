@@ -82,35 +82,40 @@ def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
 
 
 class SkillModule(dspy.Module):
-    """A DSPy module that wraps a skill file for optimization.
+    """A DSPy module that wraps a skill file body for optimization.
 
-    The skill text (body) is the parameter that GEPA optimizes.
-    On each forward pass, the module:
-    1. Uses the skill text as instructions
-    2. Processes the task input
-    3. Returns the agent's response
+    **Design (Phase II of meta-harness roadmap, 2026-04):** the skill body
+    text is bound as the signature's ``instructions`` field, NOT as an
+    input field. DSPy optimizers (GEPA, MIPROv2, COPRO) mutate
+    ``signature.instructions``; before this refactor the skill text was
+    passed as an input and never mutated, so ``evolved_skill.txt`` was
+    byte-identical to baseline. See ``PromptSectionModule`` for the full
+    rationale. Frontmatter is handled separately via ``reassemble_skill``.
     """
-
-    class TaskWithSkill(dspy.Signature):
-        """Complete a task following the provided skill instructions.
-
-        You are an AI agent following specific skill instructions to complete a task.
-        Read the skill instructions carefully and follow the procedure described.
-        """
-        skill_instructions: str = dspy.InputField(desc="The skill instructions to follow")
-        task_input: str = dspy.InputField(desc="The task to complete")
-        output: str = dspy.OutputField(desc="Your response following the skill instructions")
 
     def __init__(self, skill_text: str):
         super().__init__()
-        self.skill_text = skill_text
-        self.predictor = dspy.ChainOfThought(self.TaskWithSkill)
+        sig = dspy.Signature(
+            "task_input -> output",
+            instructions=skill_text,
+        )
+        self.predictor = dspy.ChainOfThought(sig)
+
+    @property
+    def skill_text(self) -> str:
+        """Read the current skill body text from the predictor's signature.
+
+        After a GEPA run, this returns the EVOLVED skill body — not the
+        baseline. ``reassemble_skill(frontmatter, module.skill_text)``
+        produces the deployable full skill file.
+        """
+        try:
+            return self.predictor.predict.signature.instructions or ""
+        except Exception:  # pragma: no cover
+            return ""
 
     def forward(self, task_input: str) -> dspy.Prediction:
-        result = self.predictor(
-            skill_instructions=self.skill_text,
-            task_input=task_input,
-        )
+        result = self.predictor(task_input=task_input)
         return dspy.Prediction(output=result.output)
 
 

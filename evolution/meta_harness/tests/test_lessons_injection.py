@@ -155,18 +155,28 @@ def test_prompt_section_module_reads_lessons(tmp_path: Path):
 
     captured: dict = {}
 
-    def fake_predictor(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(output="stub")
+    class _FakePred:
+        def __init__(self):
+            self.predict = SimpleNamespace(
+                signature=SimpleNamespace(instructions="Base prompt")
+            )
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output="stub")
 
     module = PromptSectionModule("Base prompt")
-    module.predictor = fake_predictor
+    module.predictor = _FakePred()
     module.forward(task_input="hello")
 
     assert "prior_lessons" in captured
     assert "Risk Dashboard" in captured["prior_lessons"]
-    assert captured["system_guidance"] == "Base prompt"
+    # After Phase II refactor, system_guidance is NOT a kwarg anymore —
+    # section_text is the predictor's signature.instructions. The forward
+    # call only passes prior_lessons + task_input.
+    assert "system_guidance" not in captured
     assert captured["task_input"] == "hello"
+    # Verify section_text property reads through to the instructions
+    assert module.section_text == "Base prompt"
 
 
 def test_prompt_section_module_empty_lessons_when_none_set(tmp_path: Path):
@@ -176,12 +186,17 @@ def test_prompt_section_module_empty_lessons_when_none_set(tmp_path: Path):
 
     captured: dict = {}
 
-    def fake_predictor(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(output="stub")
+    class _FakePred:
+        def __init__(self):
+            self.predict = SimpleNamespace(
+                signature=SimpleNamespace(instructions="Base")
+            )
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output="stub")
 
     module = PromptSectionModule("Base")
-    module.predictor = fake_predictor
+    module.predictor = _FakePred()
     module.forward(task_input="hi")
 
     assert captured["prior_lessons"] == ""
@@ -194,18 +209,26 @@ def test_tool_desc_module_reads_lessons(tmp_path: Path):
 
     captured: dict = {}
 
-    def fake_predictor(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(output="stub")
+    class _FakePred:
+        def __init__(self):
+            self.predict = SimpleNamespace(
+                signature=SimpleNamespace(instructions="search files")
+            )
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output="stub")
 
     module = ToolDescModule("search files")
-    module.predictor = fake_predictor
+    module.predictor = _FakePred()
     module.forward(task_input="find something", available_tools="a, b, c")
 
     assert "prior_lessons" in captured
     assert "regex" in captured["prior_lessons"]
-    assert captured["tool_description"] == "search files"
+    # After Phase II refactor: tool_description is NOT a kwarg anymore —
+    # the description IS the predictor's signature.instructions.
+    assert "tool_description" not in captured
     assert captured["available_tools"] == "a, b, c"
+    assert module.description_text == "search files"
 
 
 def test_forward_hook_isolates_lessons_per_run():

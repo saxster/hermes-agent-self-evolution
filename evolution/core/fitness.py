@@ -19,14 +19,22 @@ class FitnessScore:
     conciseness: float = 0.0  # Was it appropriately concise? (0-1)
     length_penalty: float = 0.0  # Penalty for being too verbose (0-1, 0 = no penalty)
     feedback: str = ""  # Textual feedback for GEPA's reflective analysis
+    # Signal-informed weights (defaults match original hardcoded values)
+    _w_correctness: float = 0.5
+    _w_procedure: float = 0.3
+    _w_conciseness: float = 0.2
 
     @property
     def composite(self) -> float:
-        """Weighted composite score."""
+        """Weighted composite score.
+
+        Weights can be overridden per-skill based on implicit signal data
+        (e.g., skills with high correction rates get higher correctness weight).
+        """
         raw = (
-            0.5 * self.correctness
-            + 0.3 * self.procedure_following
-            + 0.2 * self.conciseness
+            self._w_correctness * self.correctness
+            + self._w_procedure * self.procedure_following
+            + self._w_conciseness * self.conciseness
         )
         return max(0.0, raw - self.length_penalty)
 
@@ -104,36 +112,137 @@ class LLMJudge:
         )
 
 
-def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
-    """DSPy-compatible metric function for skill optimization.
+DEFAULT_FITNESS_WEIGHTS = {
+    "correctness_weight": 0.5,
+    "procedure_weight": 0.3,
+    "conciseness_weight": 0.2,
+}
 
-    This is what gets passed to dspy.GEPA(metric=...).
-    Returns a float 0-1 score.
+
+def _structure_score(text: str) -> float:
+    """Proxy for "follows expected procedure" — how structured is the output?
+
+    Heuristic: presence of markdown structure (headings, lists, code blocks)
+    indicates the agent followed a procedural format rather than freeform prose.
+    Returns 0.0-1.0.
     """
-    # The prediction should have an 'output' field with the agent's response
-    agent_output = getattr(prediction, "output", "") or ""
-    expected = getattr(example, "expected_behavior", "") or ""
-    task = getattr(example, "task_input", "") or ""
+    if not text or not text.strip():
+        return 0.0
+    signals = [
+        ("##", 0.2),       # markdown headers
+        ("- ", 0.15),       # bullet list
+        ("1.", 0.1),        # numbered list
+        ("```", 0.15),      # fenced code block
+        ("**", 0.1),        # bold emphasis
+        ("\n\n", 0.1),      # paragraph separation
+    ]
+    score = 0.3  # Base score for any non-empty text
+    for signal, weight in signals:
+        if signal in text:
+            score += weight
+    return min(1.0, score)
 
-    if not agent_output.strip():
+
+def _conciseness_score(output: str, expected: str) -> float:
+    """Proxy for "appropriately concise" — penalize outputs drastically longer
+    than the expected rubric suggests, but don't reward ultra-short answers.
+
+    Returns 0.0-1.0. A ratio of 1.0-2.0× expected length scores highest;
+    ratios >4× or <0.3× are penalized.
+    """
+    if not output:
+        return 0.0
+    if not expected:
+        return 0.5  # No rubric length to compare against
+    out_len = len(output)
+    exp_len = max(1, len(expected))
+    ratio = out_len / exp_len
+    if ratio < 0.3:
+        return 0.2  # Too short — likely missing required content
+    if ratio <= 2.0:
+        return 1.0  # Ideal range
+    if ratio <= 4.0:
+        return 0.8 - (ratio - 2.0) * 0.2  # Linear falloff from 0.8 → 0.4
+    return 0.3  # Very verbose
+
+
+def _correctness_score(output: str, expected: str) -> float:
+    """Keyword overlap proxy — how many expected_behavior words appear in the output.
+
+    Returns 0.0-1.0. This is the same heuristic the old skill_fitness_metric used.
+    """
+    if not output.strip():
+        return 0.0
+    if not expected.strip():
+        return 0.5
+    expected_words = set(expected.lower().split())
+    output_words = set(output.lower().split())
+    if not expected_words:
+        return 0.5
+    overlap = len(expected_words & output_words) / len(expected_words)
+    return min(1.0, 0.3 + 0.7 * overlap)
+
+
+def compute_weighted_fitness(
+    agent_output: str,
+    expected_behavior: str,
+    weights: Optional[dict] = None,
+) -> float:
+    """Compute a weighted fitness score from agent output + rubric + weights.
+
+    Shared by skill_fitness_metric, prompt_section_fitness, and
+    tool_selection_fitness. Signal-informed weights (from
+    signal_importers.get_signal_enhanced_fitness_weight) override the
+    defaults to emphasize whichever dimension real user behavior showed
+    was underperforming for that artifact.
+
+    Returns a float in [0.0, 1.0].
+    """
+    if not agent_output or not agent_output.strip():
         return 0.0
 
-    # Quick heuristic scoring (for speed during optimization)
-    # Full LLM-as-judge scoring is expensive — use it selectively
-    score = 0.5  # Base score for non-empty output
+    w = dict(DEFAULT_FITNESS_WEIGHTS)
+    if weights:
+        for k in ("correctness_weight", "procedure_weight", "conciseness_weight"):
+            if k in weights:
+                w[k] = float(weights[k])
 
-    # Check if key phrases from expected behavior appear
-    expected_lower = expected.lower()
-    output_lower = agent_output.lower()
+    correctness = _correctness_score(agent_output, expected_behavior)
+    procedure = _structure_score(agent_output)
+    conciseness = _conciseness_score(agent_output, expected_behavior)
 
-    # Simple keyword overlap as a fast proxy
-    expected_words = set(expected_lower.split())
-    output_words = set(output_lower.split())
-    if expected_words:
-        overlap = len(expected_words & output_words) / len(expected_words)
-        score = 0.3 + (0.7 * overlap)
+    composite = (
+        w["correctness_weight"] * correctness
+        + w["procedure_weight"] * procedure
+        + w["conciseness_weight"] * conciseness
+    )
+    return max(0.0, min(1.0, composite))
 
-    return min(1.0, max(0.0, score))
+
+def skill_fitness_metric(
+    example: dspy.Example,
+    prediction: dspy.Prediction,
+    trace=None,
+    pred_name=None,
+    pred_trace=None,
+    weights: Optional[dict] = None,
+) -> float:
+    """DSPy-compatible metric function for skill optimization.
+
+    Accepts both the 3-arg MIPROv2 signature and the 5-arg GEPA signature
+    (gold, pred, trace, pred_name, pred_trace) via default None values.
+
+    Args:
+        weights: Optional dict with correctness_weight, procedure_weight,
+                 conciseness_weight from
+                 signal_importers.get_signal_enhanced_fitness_weight().
+                 When supplied, these override DEFAULT_FITNESS_WEIGHTS.
+
+    Returns a float 0-1 score.
+    """
+    agent_output = getattr(prediction, "output", "") or ""
+    expected = getattr(example, "expected_behavior", "") or ""
+    return compute_weighted_fitness(agent_output, expected, weights=weights)
 
 
 def _parse_score(value) -> float:

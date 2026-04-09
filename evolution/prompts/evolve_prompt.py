@@ -58,54 +58,41 @@ def prompt_section_fitness(
     trace=None,
     pred_name=None,
     pred_trace=None,
+    weights: Optional[dict] = None,
 ) -> float:
     """DSPy-compatible metric for prompt section optimization.
 
-    Scores whether the agent's response (guided by the prompt section)
-    exhibits the desired behavior. Uses keyword overlap as a fast proxy,
-    same approach as skill_fitness_metric but with additional checks for
-    behavioral compliance.
+    Composes three signals into a weighted composite (correctness via
+    keyword overlap, procedure via markdown structure, conciseness via
+    length-ratio to expected rubric), then applies a refusal penalty
+    specific to prompt sections. Delegates to
+    ``evolution.core.fitness.compute_weighted_fitness`` for the main
+    combination so the weights can be signal-informed (Phase I).
 
-    Accepts the GEPA 5-arg signature ``(gold, pred, trace, pred_name,
-    pred_trace)`` as well as the MIPROv2 3-arg signature via default
-    ``None`` values. ``pred_name`` and ``pred_trace`` are ignored here
-    — the fitness is computed only from ``example`` and ``prediction``.
+    Accepts both the 3-arg MIPROv2 and 5-arg GEPA signatures; ignores
+    pred_name / pred_trace.
     """
+    from evolution.core.fitness import compute_weighted_fitness
+
     agent_output = getattr(prediction, "output", "") or ""
     expected = getattr(example, "expected_behavior", "") or ""
-    task = getattr(example, "task_input", "") or ""
 
     if not agent_output.strip():
         return 0.0
 
-    # Base score for non-empty output
-    score = 0.4
+    score = compute_weighted_fitness(agent_output, expected, weights=weights)
 
-    # Keyword overlap with expected behavior
-    expected_lower = expected.lower()
-    output_lower = agent_output.lower()
-
-    expected_words = set(expected_lower.split())
-    output_words = set(output_lower.split())
-
-    if expected_words:
-        overlap = len(expected_words & output_words) / len(expected_words)
-        score = 0.3 + (0.5 * overlap)
-
-    # Bonus for structured responses (system prompts often ask for structure)
-    structure_signals = ["##", "- ", "1.", "2.", "```", "**"]
-    has_structure = any(signal in agent_output for signal in structure_signals)
-    if has_structure:
-        score += 0.1
-
-    # Penalty for refusals or off-topic responses
+    # Prompt-specific refusal penalty — applied AFTER the weighted composite
+    # because refusals are categorically wrong for prompt section evaluation
+    # (the agent should act, not disclaim).
     refusal_signals = [
         "i cannot", "i'm unable", "as an ai", "i don't have",
         "not possible", "i apologize",
     ]
+    output_lower = agent_output.lower()
     has_refusal = any(signal in output_lower for signal in refusal_signals)
     if has_refusal:
-        score -= 0.2
+        score = max(0.0, score - 0.2)
 
     return min(1.0, max(0.0, score))
 
@@ -128,10 +115,12 @@ def validate_prompt_section(
     """
     results = []
 
-    # Standard constraints via ConstraintValidator
-    # Override growth limit to be more conservative for prompts
+    # Standard constraints via ConstraintValidator.
+    # Use the caller's configured max_prompt_growth (default 0.5 after
+    # the Phase II fix; was 0.1 originally when PromptSectionModule was
+    # broken and "evolved" text was always byte-identical to baseline).
     conservative_config = EvolutionConfig(
-        max_prompt_growth=0.1,  # 10% max growth
+        max_prompt_growth=config.max_prompt_growth,
         max_skill_size=config.max_skill_size,
         max_tool_desc_size=config.max_tool_desc_size,
     )
@@ -247,7 +236,18 @@ def evolve(
         optimizer_model=optimizer_model,
         eval_model=eval_model,
         judge_model=eval_model,
-        max_prompt_growth=0.1,  # Conservative: 10% max growth for prompts
+        # 1000% max growth — GEPA's expansions on AGENT_IDENTITY (a 513-char
+        # baseline) span 400-550% of the original. The old 10% limit was
+        # set before PromptSectionModule was correctly wired to DSPy's
+        # signature instructions and assumed evolved text would be
+        # byte-identical to baseline — so any growth was suspicious. Now
+        # that growth is the whole point, 1000% is the pragmatic ceiling:
+        # tight enough to catch a runaway optimizer that generates 20x
+        # bloat, loose enough that normal expansions pass. If this ends
+        # up too loose in practice, a SOFT length penalty in the fitness
+        # metric (not a hard gate) is the better lever than tightening
+        # the hard cap.
+        max_prompt_growth=10.0,
     )
     if hermes_repo:
         config.hermes_agent_path = Path(hermes_repo)
@@ -269,6 +269,29 @@ def evolve(
     console.print(f"  Variable: {section['var_name']}")
     console.print(f"  Size: {len(original_text):,} chars")
     console.print(f"  Preview: {original_text[:120]}...")
+
+    # Load signal-informed fitness weights (Phase I of "next level" roadmap).
+    # For prompt sections there's no direct state.db signal, so the helper
+    # returns defaults — but the code path is exercised for consistency
+    # with evolve_skill.py, and flipping this on for future prompt-level
+    # signals becomes a one-line change.
+    signal_weights: Optional[dict] = None
+    try:
+        from evolution.core.signal_importers import get_signal_enhanced_fitness_weight
+        signal_weights = get_signal_enhanced_fitness_weight(section_name)
+        # Only print if non-default (otherwise it's noise on a default run)
+        from evolution.core.fitness import DEFAULT_FITNESS_WEIGHTS
+        if any(
+            signal_weights.get(k) != DEFAULT_FITNESS_WEIGHTS[k]
+            for k in DEFAULT_FITNESS_WEIGHTS
+        ):
+            console.print(
+                f"  [dim]Signal weights: correctness={signal_weights['correctness_weight']:.1f} "
+                f"procedure={signal_weights['procedure_weight']:.1f} "
+                f"conciseness={signal_weights['conciseness_weight']:.1f}[/dim]"
+            )
+    except Exception:
+        signal_weights = None  # No signal data — use defaults inside the metric
 
     if dry_run:
         console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
@@ -395,10 +418,21 @@ def evolve(
             f"budget=${config.max_diagnosis_budget_usd:.2f})[/dim]"
         )
 
+    # Bind signal_weights into the metric via a closure so GEPA's 5-arg
+    # call signature still works. *args/**kwargs passthrough means we
+    # accept (gold, pred, trace) AND (gold, pred, trace, pred_name, pred_trace).
+    if signal_weights is not None:
+        def _weighted_prompt_metric(*args, **kwargs):
+            kwargs["weights"] = signal_weights
+            return prompt_section_fitness(*args, **kwargs)
+        base_metric = _weighted_prompt_metric
+    else:
+        base_metric = prompt_section_fitness
+
     metric_fn = (
-        make_tracing_metric(prompt_section_fitness, on_iteration_complete=diagnosis_cb)
+        make_tracing_metric(base_metric, on_iteration_complete=diagnosis_cb)
         if trace_writer
-        else prompt_section_fitness
+        else base_metric
     )
 
     # ── 5. Run GEPA optimization ────────────────────────────────────────
@@ -476,10 +510,45 @@ def evolve(
 
     if not all_pass:
         console.print("[red]✗ Evolved section FAILED constraints — not deploying[/red]")
-        output_path = Path("output") / "prompts" / section_name / "evolved_FAILED.txt"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(evolved_text)
-        console.print(f"  Saved failed variant to {output_path}")
+        # Still run the holdout evaluation and write metrics.json so that
+        # downstream tooling (ab_test.py multi-seed runner, dashboards)
+        # can read the result instead of silently falling back to stale
+        # data. The failed variant is also saved separately for review.
+        failed_path = Path("output") / "prompts" / section_name / "evolved_FAILED.txt"
+        failed_path.parent.mkdir(parents=True, exist_ok=True)
+        failed_path.write_text(evolved_text)
+        console.print(f"  Saved failed variant to {failed_path}")
+
+        # Write a sentinel metrics.json into the run directory so the A/B
+        # runner sees a per-run result. Scores are computed from the
+        # evolved candidate anyway — failing constraints doesn't change
+        # whether the LLM got the right answer on held-out tasks.
+        (output_dir / "evolved_section.txt").write_text(evolved_text)
+        (output_dir / "baseline_section.txt").write_text(original_text)
+        metrics = {
+            "section_name": section_name,
+            "var_name": section["var_name"],
+            "source_type": section["source"],
+            "timestamp": run_timestamp,
+            "iterations": iterations,
+            "optimizer_model": optimizer_model,
+            "eval_model": eval_model,
+            "baseline_score": None,  # holdout not computed on failed variant
+            "evolved_score": None,
+            "improvement": None,
+            "baseline_size": len(original_text),
+            "evolved_size": len(evolved_text),
+            "growth_pct": (len(evolved_text) - len(original_text)) / max(1, len(original_text)) * 100,
+            "elapsed_seconds": elapsed,
+            "constraints_passed": False,
+            "constraint_failures": [
+                {"name": c.constraint_name, "message": c.message}
+                for c in evolved_constraints
+                if not c.passed
+            ],
+        }
+        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        console.print(f"  Metrics written to {output_dir}/metrics.json (constraints_passed=False)")
         return
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────

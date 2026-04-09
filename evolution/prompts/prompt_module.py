@@ -206,37 +206,54 @@ def _unescape_python_string(s: str) -> str:
 class PromptSectionModule(dspy.Module):
     """A DSPy module that wraps one system prompt section for optimization.
 
-    The section text is the parameter that GEPA optimizes.
-    On each forward pass, the module uses the section as part of system
-    instructions and evaluates agent response quality.
+    **Design (Phase II of meta-harness roadmap, 2026-04):** the section text
+    is bound as the signature's ``instructions`` field, NOT as an input
+    field. This is the critical correctness fix — DSPy optimizers (GEPA,
+    MIPROv2, COPRO) mutate ``signature.instructions``. Before this refactor,
+    ``section_text`` was passed as an input field and never mutated, so
+    ``evolved_section.txt`` was byte-identical to baseline on every run.
+
+    After the refactor:
+      - ``self.section_text`` is a property that reads from
+        ``self.predictor.predict.signature.instructions``
+      - GEPA mutates the instructions across iterations
+      - The property returns the current evolved text
+      - Downstream code (e.g. ``reassemble_prompt``) gets the real evolved
+        text when it reads ``optimized_module.section_text``
+      - ``prior_lessons`` remains an input field because it's dynamic
+        per-call context (loaded fresh by the forward hook), not something
+        the optimizer should mutate
     """
-
-    class TaskWithPromptSection(dspy.Signature):
-        """Complete a task following the system prompt guidance.
-
-        You are an AI agent with specific behavioral guidance injected
-        into your system prompt. Follow the guidance naturally and
-        complete the task.
-        """
-        system_guidance: str = dspy.InputField(desc="The system prompt section providing behavioral guidance")
-        prior_lessons: str = dspy.InputField(desc="Failure patterns and candidate guidance distilled from prior GEPA iterations (may be empty on the first iteration). Use this to avoid repeating mistakes and to build on what has worked.")
-        task_input: str = dspy.InputField(desc="The task to complete")
-        output: str = dspy.OutputField(desc="Your response following the system guidance")
 
     def __init__(self, section_text: str):
         super().__init__()
-        self.section_text = section_text
-        self.predictor = dspy.ChainOfThought(self.TaskWithPromptSection)
+        # Dynamic signature: the INSTRUCTIONS ARE the section text.
+        # GEPA/MIPROv2 will mutate signature.instructions across iterations.
+        sig = dspy.Signature(
+            "prior_lessons, task_input -> output",
+            instructions=section_text,
+        )
+        self.predictor = dspy.ChainOfThought(sig)
+
+    @property
+    def section_text(self) -> str:
+        """Read the current section text from the predictor's signature.
+
+        After a GEPA run, this returns the EVOLVED text — not the baseline.
+        That's the whole point of the refactor. Callers that used to do
+        ``baseline_module.section_text`` before optimization get the
+        baseline; callers that do ``optimized_module.section_text`` after
+        optimization get the evolved text.
+        """
+        try:
+            return self.predictor.predict.signature.instructions or ""
+        except Exception:  # pragma: no cover
+            return ""
 
     def forward(self, task_input: str) -> dspy.Prediction:
-        # Meta-harness hook: if a trace writer is active, tell it which
-        # candidate text produced this prediction. Cheap no-op otherwise.
-        #
-        # Candidate = (section_text, predictor_instructions). DSPy optimizers
-        # (GEPA, MIPROv2) mutate the PREDICTOR's signature instructions, not
-        # the module's section_text Python attribute, so we must hash both to
-        # detect iteration boundaries correctly. See memory
-        # reference_dspy_gepa_instrumentation.md for why.
+        # Meta-harness hook: if a trace writer is active, record the
+        # current signature instructions as the candidate. No longer a
+        # composite — signature.instructions IS the candidate now.
         prior_lessons = ""
         try:
             from evolution.meta_harness.trace_writer import (
@@ -245,21 +262,12 @@ class PromptSectionModule(dspy.Module):
             )
             _writer = get_active_writer()
             if _writer is not None:
-                try:
-                    _instr = self.predictor.predict.signature.instructions or ""
-                except Exception:  # pragma: no cover
-                    _instr = ""
-                _composite = (
-                    f"section_text:\n{self.section_text}\n\n"
-                    f"predictor_instructions:\n{_instr}"
-                )
-                _writer.set_candidate(_composite)
+                _writer.set_candidate(self.section_text)
             prior_lessons = get_active_lessons()
         except Exception:  # pragma: no cover — never block optimization
             prior_lessons = ""
 
         result = self.predictor(
-            system_guidance=self.section_text,
             prior_lessons=prior_lessons,
             task_input=task_input,
         )

@@ -55,6 +55,7 @@ def tool_selection_fitness(
     trace=None,
     pred_name=None,
     pred_trace=None,
+    weights: Optional[dict] = None,  # accepted for API consistency, not used
 ) -> float:
     """DSPy-compatible metric for tool description optimization.
 
@@ -64,6 +65,13 @@ def tool_selection_fitness(
     Accepts the GEPA 5-arg signature ``(gold, pred, trace, pred_name,
     pred_trace)`` as well as the MIPROv2 3-arg signature via default
     ``None`` values.
+
+    The ``weights`` kwarg is accepted for signature consistency with
+    skill_fitness_metric / prompt_section_fitness (so the
+    signal-weights-closure pattern in evolve_tool_desc.py works without
+    special casing), but tool selection accuracy is a categorical signal
+    and doesn't map to the correctness/procedure/conciseness decomposition,
+    so weights are currently ignored here.
 
     The example should have:
       - task_input: the user's request
@@ -394,10 +402,31 @@ def evolve(
             f"budget=${config.max_diagnosis_budget_usd:.2f})[/dim]"
         )
 
+    # Load signal-informed fitness weights (Phase I of "next level" roadmap).
+    # tool_selection_fitness currently ignores weights (tool selection is
+    # categorical, not dimensional) but accepts the kwarg for API
+    # consistency. Wiring this up now means future changes — e.g. blending
+    # structure/conciseness into the categorical score — become a one-line
+    # config flip rather than a re-plumbing.
+    signal_weights: Optional[dict] = None
+    try:
+        from evolution.core.signal_importers import get_signal_enhanced_fitness_weight
+        signal_weights = get_signal_enhanced_fitness_weight(tool_name)
+    except Exception:
+        signal_weights = None
+
+    if signal_weights is not None:
+        def _weighted_tool_metric(*args, **kwargs):
+            kwargs["weights"] = signal_weights
+            return tool_selection_fitness(*args, **kwargs)
+        base_metric = _weighted_tool_metric
+    else:
+        base_metric = tool_selection_fitness
+
     metric_fn = (
-        make_tracing_metric(tool_selection_fitness, on_iteration_complete=diagnosis_cb)
+        make_tracing_metric(base_metric, on_iteration_complete=diagnosis_cb)
         if trace_writer
-        else tool_selection_fitness
+        else base_metric
     )
 
     # ── 5. Run GEPA optimization ────────────────────────────────────────

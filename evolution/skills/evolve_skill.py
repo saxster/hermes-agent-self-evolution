@@ -67,6 +67,17 @@ def evolve(
     skill = load_skill(skill_path)
     console.print(f"  Loaded: {skill_path.relative_to(config.hermes_agent_path)}")
     console.print(f"  Name: {skill['name']}")
+
+    # Load signal-informed fitness weights (if implicit signal data exists)
+    signal_weights = None
+    try:
+        from evolution.core.signal_importers import get_signal_enhanced_fitness_weight
+        signal_weights = get_signal_enhanced_fitness_weight(skill_name)
+        console.print(f"  Signal weights: correctness={signal_weights['correctness_weight']:.1f} "
+                       f"procedure={signal_weights['procedure_weight']:.1f} "
+                       f"conciseness={signal_weights['conciseness_weight']:.1f}")
+    except Exception:
+        pass  # No signal data — use default weights
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
 
@@ -153,28 +164,48 @@ def evolve(
 
     start_time = time.time()
 
-    try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
-        )
+    # Build metric function with signal-informed weights (if available).
+    # Wrapper must use *args, **kwargs so it accepts both MIPROv2's 3-arg
+    # and GEPA's 5-arg (gold, pred, trace, pred_name, pred_trace) contracts.
+    if signal_weights:
+        def _weighted_metric(*args, **kwargs):
+            kwargs["weights"] = signal_weights
+            return skill_fitness_metric(*args, **kwargs)
+        effective_metric = _weighted_metric
+    else:
+        effective_metric = skill_fitness_metric
 
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+    try:
+        try:
+            # GEPA signature: max_full_evals (not max_steps), reflection_lm
+            # required. See memory reference_dspy_gepa_instrumentation.md.
+            reflection_lm = dspy.LM(optimizer_model)
+            optimizer = dspy.GEPA(
+                metric=effective_metric,
+                max_full_evals=iterations,
+                reflection_lm=reflection_lm,
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+                valset=valset,
+            )
+            console.print(f"[dim]  Optimizer: dspy.GEPA (max_full_evals={iterations}, reflection_lm={optimizer_model})[/dim]")
+        except Exception as e:
+            console.print(
+                f"[yellow]⚠ dspy.GEPA failed ({type(e).__name__}: {e}), "
+                f"falling back to dspy.MIPROv2[/yellow]"
+            )
+            optimizer = dspy.MIPROv2(
+                metric=effective_metric,
+                auto="light",
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+            )
+    finally:
+        pass  # placeholder for future cleanup hooks
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")

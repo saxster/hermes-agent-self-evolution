@@ -214,35 +214,33 @@ def _extract_description_from_register(source: str, tool_name: str) -> Optional[
 class ToolDescModule(dspy.Module):
     """A DSPy module that wraps a tool description for optimization.
 
-    The tool description text is the parameter that GEPA optimizes.
-    On each forward pass, the module simulates tool selection: given a
-    user task, it uses the tool description to decide if this is the
-    right tool, then produces a justification.
+    **Design (Phase II of meta-harness roadmap, 2026-04):** the description
+    text is bound as the signature's ``instructions`` field, NOT as an
+    input field. DSPy optimizers mutate ``signature.instructions``; before
+    this refactor the description was passed as an input and never mutated,
+    so ``evolved_description.txt`` was byte-identical to baseline on every
+    run. See ``PromptSectionModule`` for the full rationale.
     """
-
-    class ToolSelection(dspy.Signature):
-        """Decide whether a tool should be selected for a given task.
-
-        You are an AI agent deciding which tool to use. Read the tool description
-        and determine if this tool is the right choice for the task. Explain your
-        reasoning and state your selection decision.
-        """
-        tool_description: str = dspy.InputField(desc="The tool's description text")
-        prior_lessons: str = dspy.InputField(desc="Failure patterns and description-writing guidance distilled from prior GEPA iterations (may be empty on the first iteration).")
-        task_input: str = dspy.InputField(desc="The user's task or request")
-        available_tools: str = dspy.InputField(desc="Comma-separated list of all available tool names")
-        output: str = dspy.OutputField(desc="Your tool selection decision and reasoning")
 
     def __init__(self, description_text: str):
         super().__init__()
-        self.description_text = description_text
-        self.predictor = dspy.ChainOfThought(self.ToolSelection)
+        sig = dspy.Signature(
+            "prior_lessons, task_input, available_tools -> output",
+            instructions=description_text,
+        )
+        self.predictor = dspy.ChainOfThought(sig)
+
+    @property
+    def description_text(self) -> str:
+        """Read the current description text from the predictor's signature."""
+        try:
+            return self.predictor.predict.signature.instructions or ""
+        except Exception:  # pragma: no cover
+            return ""
 
     def forward(self, task_input: str, available_tools: str = "") -> dspy.Prediction:
-        # Meta-harness hook: if a trace writer is active, tell it which
-        # candidate description produced this prediction. No-op otherwise.
-        # Hash both description_text AND predictor instructions because
-        # DSPy optimizers mutate the latter, not the former.
+        # Meta-harness hook: record the current signature instructions
+        # (which IS the description_text after the refactor).
         prior_lessons = ""
         try:
             from evolution.meta_harness.trace_writer import (
@@ -251,21 +249,12 @@ class ToolDescModule(dspy.Module):
             )
             _writer = get_active_writer()
             if _writer is not None:
-                try:
-                    _instr = self.predictor.predict.signature.instructions or ""
-                except Exception:  # pragma: no cover
-                    _instr = ""
-                _composite = (
-                    f"description_text:\n{self.description_text}\n\n"
-                    f"predictor_instructions:\n{_instr}"
-                )
-                _writer.set_candidate(_composite)
+                _writer.set_candidate(self.description_text)
             prior_lessons = get_active_lessons()
         except Exception:  # pragma: no cover — never block optimization
             prior_lessons = ""
 
         result = self.predictor(
-            tool_description=self.description_text,
             prior_lessons=prior_lessons,
             task_input=task_input,
             available_tools=available_tools,

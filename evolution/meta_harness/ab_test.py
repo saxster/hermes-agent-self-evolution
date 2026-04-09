@@ -57,13 +57,26 @@ class RunResult:
     @classmethod
     def from_metrics_json(cls, metrics_path: Path) -> "RunResult":
         data = json.loads(metrics_path.read_text())
+
+        # Handle null scores gracefully — the constraint-failure path in
+        # evolve_prompt.py writes `null` for baseline_score/evolved_score
+        # when the evolved candidate fails constraints before holdout
+        # evaluation runs. We treat those as 0.0 so the A/B runner can
+        # still produce a delta (which will be 0.0 for that pair —
+        # effectively "no signal from this seed").
+        def _or_zero(val) -> float:
+            try:
+                return float(val) if val is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
         return cls(
             metrics_path=metrics_path,
-            baseline_score=float(data.get("baseline_score", 0.0)),
-            evolved_score=float(data.get("evolved_score", 0.0)),
-            improvement=float(data.get("improvement", 0.0)),
-            iterations=int(data.get("iterations", 0)),
-            elapsed_seconds=float(data.get("elapsed_seconds", 0.0)),
+            baseline_score=_or_zero(data.get("baseline_score")),
+            evolved_score=_or_zero(data.get("evolved_score")),
+            improvement=_or_zero(data.get("improvement")),
+            iterations=int(data.get("iterations", 0) or 0),
+            elapsed_seconds=_or_zero(data.get("elapsed_seconds")),
         )
 
 
@@ -167,11 +180,88 @@ def compare(baseline: RunResult, treatment: RunResult) -> tuple[bool, list[str]]
     return ship, reasons
 
 
+def run_multi_seed_ab(
+    section: str,
+    iterations: int,
+    seeds: list[int],
+) -> dict:
+    """Run N baseline/treatment pairs, one per seed, and return aggregate stats.
+
+    Returns a dict with:
+      - per_seed: list of {seed, baseline, treatment, delta}
+      - ship: bool (from bootstrap CI ship verdict)
+      - stats: dict from ship_verdict (mean, std, ci_lower, ci_upper, ...)
+    """
+    from evolution.meta_harness.statistics import ship_verdict
+
+    per_seed: list[dict] = []
+    deltas: list[float] = []
+
+    for i, seed in enumerate(seeds, start=1):
+        print(f"\n{'#' * 70}")
+        print(f"# Pair {i}/{len(seeds)} — seed={seed}")
+        print(f"{'#' * 70}")
+
+        baseline = run_variant(
+            section=section,
+            iterations=iterations,
+            seed=seed,
+            enable_filesystem_proposer=False,
+        )
+        treatment = run_variant(
+            section=section,
+            iterations=iterations,
+            seed=seed,
+            enable_filesystem_proposer=True,
+        )
+
+        delta = treatment.evolved_score - baseline.evolved_score
+        per_seed.append({
+            "seed": seed,
+            "baseline": {
+                "metrics_path": str(baseline.metrics_path),
+                "baseline_score": baseline.baseline_score,
+                "evolved_score": baseline.evolved_score,
+                "improvement": baseline.improvement,
+                "elapsed_seconds": baseline.elapsed_seconds,
+            },
+            "treatment": {
+                "metrics_path": str(treatment.metrics_path),
+                "baseline_score": treatment.baseline_score,
+                "evolved_score": treatment.evolved_score,
+                "improvement": treatment.improvement,
+                "elapsed_seconds": treatment.elapsed_seconds,
+            },
+            "delta": delta,
+        })
+        deltas.append(delta)
+
+        print(f"  pair {i} delta: {delta:+.4f}")
+
+    ship, stats = ship_verdict(deltas)
+    return {
+        "per_seed": per_seed,
+        "ship": ship,
+        "stats": stats,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Meta-harness A/B ship gate")
     parser.add_argument("--section", required=True, help="Prompt section name")
     parser.add_argument("--iterations", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Legacy single-seed mode (if --seeds is not given).",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default="",
+        help="Comma-separated list of seeds for multi-seed mode, e.g. '42,43,44,45,46'. When given, overrides --seed and runs one pair per seed.",
+    )
     parser.add_argument(
         "--output-root",
         type=Path,
@@ -183,8 +273,52 @@ def main():
     args.output_root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # ── Multi-seed path (Phase III) ────────────────────────────────────
+    if args.seeds:
+        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+        print("\n" + "#" * 70)
+        print("# Meta-Harness A/B Ship Gate (MULTI-SEED)")
+        print(f"# section={args.section} iterations={args.iterations} seeds={seeds}")
+        print("#" * 70)
+
+        result = run_multi_seed_ab(
+            section=args.section,
+            iterations=args.iterations,
+            seeds=seeds,
+        )
+
+        stats = result["stats"]
+        print("\n" + "#" * 70)
+        print("# Multi-Seed A/B Ship Gate Verdict")
+        print("#" * 70)
+        print(f"  N pairs: {stats['n']}")
+        print(f"  Per-seed deltas: {[f'{d:+.4f}' for d in stats['samples']]}")
+        print(f"  Mean delta: {stats['mean']:+.4f}")
+        print(f"  Std dev:    {stats['std']:.4f}")
+        print(f"  {int(stats['confidence'] * 100)}% CI: [{stats['ci_lower']:+.4f}, {stats['ci_upper']:+.4f}]")
+        print(f"  Ship criterion: CI lower > {stats['min_ci_lower']}")
+        print(f"  Verdict: {stats['reason']}")
+        print()
+        print(f"DECISION: {'SHIP' if result['ship'] else 'DO NOT SHIP'}")
+
+        report_path = args.output_root / f"{args.section}_{timestamp}_multiseed.json"
+        report_path.write_text(
+            json.dumps({
+                "section": args.section,
+                "iterations": args.iterations,
+                "seeds": seeds,
+                "timestamp": timestamp,
+                "per_seed": result["per_seed"],
+                "stats": stats,
+                "ship": result["ship"],
+            }, indent=2)
+        )
+        print(f"\nReport saved: {report_path}")
+        sys.exit(0 if result["ship"] else 1)
+
+    # ── Legacy single-seed path ────────────────────────────────────────
     print("\n" + "#" * 70)
-    print("# Meta-Harness A/B Ship Gate")
+    print("# Meta-Harness A/B Ship Gate (SINGLE-SEED — noisy, consider --seeds for statistical rigor)")
     print(f"# section={args.section} iterations={args.iterations} seed={args.seed}")
     print("#" * 70)
 
