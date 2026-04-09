@@ -383,3 +383,86 @@ def test_read_file_relative_path_resolves_against_archive(fake_archive: Path):
     result = agent.run()
     output = result.tool_calls[0]["output_preview"]
     assert "error" not in output.lower() or "Risk Dashboard" in output
+
+
+# ── Transcript persistence ─────────────────────────────────────────────
+
+
+def test_transcript_persisted_on_success(fake_archive: Path):
+    """A successful diagnosis run writes diagnosis/diagnosis_000.json."""
+    llm = ScriptedLLM([
+        _assistant_with_tool_calls([
+            _tc("write_lessons", {"content": "## Failure patterns\n- test"}, "c1"),
+        ]),
+    ])
+    agent = DiagnosisAgent(fake_archive, max_turns=3, llm_caller=llm)
+    result = agent.run()
+
+    assert result.stop_reason == "wrote_lessons"
+    transcript_path = fake_archive / "diagnosis" / "diagnosis_000.json"
+    assert transcript_path.exists()
+    payload = json.loads(transcript_path.read_text())
+    assert payload["stop_reason"] == "wrote_lessons"
+    assert payload["lessons_written"] is True
+    assert payload["turns_used"] == 1
+    # Messages should contain at least system + user + assistant + tool
+    assert len(payload["messages"]) >= 3
+
+
+def test_transcript_persisted_on_failure(fake_archive: Path):
+    """Even when lessons are NOT written (max_turns, llm_stopped, etc.),
+    the transcript must still be persisted for debugging."""
+    # LLM keeps reading but never writes lessons
+    llm = ScriptedLLM([
+        _assistant_with_tool_calls([_tc("read_file", {"path": "manifest.json"}, f"c{i}")])
+        for i in range(10)
+    ])
+    agent = DiagnosisAgent(fake_archive, max_turns=3, llm_caller=llm)
+    result = agent.run()
+
+    assert result.stop_reason == "max_turns"
+    assert result.lessons_path is None
+
+    transcript_path = fake_archive / "diagnosis" / "diagnosis_000.json"
+    assert transcript_path.exists()
+    payload = json.loads(transcript_path.read_text())
+    assert payload["stop_reason"] == "max_turns"
+    assert payload["lessons_written"] is False
+    # Should capture all 3 read_file calls
+    assert len(payload["tool_calls"]) == 3
+    assert all(tc["name"] == "read_file" for tc in payload["tool_calls"])
+
+
+def test_transcript_index_advances_across_runs(fake_archive: Path):
+    """Multiple diagnosis runs on the same archive produce separately-numbered transcripts."""
+    for i in range(3):
+        llm = ScriptedLLM([_assistant_text("nothing to add")])
+        agent = DiagnosisAgent(fake_archive, max_turns=2, llm_caller=llm)
+        agent.run()
+
+    diag_dir = fake_archive / "diagnosis"
+    assert (diag_dir / "diagnosis_000.json").exists()
+    assert (diag_dir / "diagnosis_001.json").exists()
+    assert (diag_dir / "diagnosis_002.json").exists()
+
+
+def test_transcript_persistence_never_crashes_run(fake_archive: Path, monkeypatch):
+    """If transcript write fails (e.g., disk full), the run should still return
+    its DiagnosisResult. Wrapped in try/except with warning log."""
+    llm = ScriptedLLM([
+        _assistant_with_tool_calls([
+            _tc("write_lessons", {"content": "## ok"}, "c1"),
+        ]),
+    ])
+    agent = DiagnosisAgent(fake_archive, max_turns=3, llm_caller=llm)
+
+    # Force the transcript write to fail
+    def _boom(*a, **kw):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(agent, "_persist_transcript", _boom)
+    result = agent.run()
+
+    # Run should still report success
+    assert result.stop_reason == "wrote_lessons"
+    assert result.lessons_path is not None

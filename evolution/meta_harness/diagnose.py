@@ -35,6 +35,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,43 +48,33 @@ logger = logging.getLogger(__name__)
 # context window. 40 KB is roughly 10-15K tokens — safe for any model.
 _MAX_TOOL_OUTPUT_CHARS = 40_000
 
-# Default diagnosis prompt. Deliberately specific about what makes a
-# "good" lessons.md vs a useless one, with a concrete example.
-_DIAGNOSIS_SYSTEM_PROMPT = """You are a diagnostic agent analyzing an AI agent's optimization archive.
+# Diagnosis system prompt — REVISED 2026-04-09 after observing that
+# gpt-4.1-mini wasted 10-15 turns on exploration and never reached
+# write_lessons. New version embeds a pre-computed archive summary
+# in the user message so the LLM has all data upfront, and demands
+# that write_lessons be called on turn 1 or 2.
+_DIAGNOSIS_SYSTEM_PROMPT = """You are a diagnostic agent. You will receive a pre-computed summary of an AI agent's optimization archive. Your single job is to write a lessons.md file that helps the NEXT optimizer iteration avoid repeating mistakes.
 
-The archive at {archive_dir} contains traces from prior candidate variants of an AI agent's system prompt (or tool description). Structure:
-
-    {archive_dir}/
-    ├── manifest.json             — run metadata
-    ├── iteration_000/
-    │   ├── candidate.txt         — the candidate text at this iteration
-    │   └── tasks/
-    │       ├── task_00001.json   — {{task_input, expected, agent_output, score, feedback, category}}
-    │       ├── task_00002.json
-    │       └── ...
-    ├── iteration_001/
-    └── ...
-
-Your job:
-1. Use `search_files` to find patterns across iterations. Look at score distributions — which task categories consistently fail? Which candidates scored highest?
-2. Use `read_file` to inspect specific failing traces in detail.
-3. Compare high-scoring candidates vs low-scoring candidates. What's different in the candidate text? What did the successful agent_output do that the failing ones didn't?
-4. Call `write_lessons` with a markdown document containing THREE sections:
+CRITICAL RULES:
+1. You MUST call `write_lessons` on your first response. Do NOT explore the archive first — the summary you receive already contains the data you need.
+2. If you want more detail on a specific trace, you may call `read_file` ONCE before writing lessons — but only if the summary is missing a concrete quote you need.
+3. Do NOT call `search_files` — the summary already has score distributions and category breakdowns.
+4. lessons.md must have exactly THREE sections:
 
    ## Failure patterns
-   3–5 specific, actionable observations. Cite task_ids and iteration numbers.
-   Example GOOD: "Tasks 003 and 007 both failed because the candidate omitted the 'Risk Dashboard' section. Iteration 002 included it and scored 0.91; iteration 005 dropped it and scored 0.62."
-   Example BAD: "Agent should be more detailed."
+   3–5 SPECIFIC observations. Reference iteration numbers and scores from the summary.
+   GOOD: "Iteration 002 scored 0.91; iteration 005 dropped the 'Risk Dashboard' section and scored 0.62."
+   BAD: "Agent should be more detailed."
 
    ## Candidate guidance
-   Concrete suggestions for the NEXT candidate. Quote exact phrases from successful candidates.
+   Concrete suggestions for the NEXT candidate. Quote exact phrases from the highest-scoring candidate.
 
    ## Do NOT suggest
-   Things already tried that hurt scores. Name the iteration and the score delta.
+   Things already tried that hurt scores. Name iterations and score deltas.
 
-Call write_lessons ONCE at the end with your full markdown. Do not call it more than once. When you are done, stop — the loop will end automatically.
+If the archive has fewer than 2 iterations, write a short lessons.md saying "Not enough data yet — iterate more." That is still a valid output.
 
-Be specific. References like "iteration 003 task_00007" are far more useful than general advice."""
+Call write_lessons ONCE. The loop will end when you do."""
 
 
 @dataclass
@@ -141,19 +132,36 @@ class DiagnosisAgent:
     # ── Public entry point ─────────────────────────────────────────────
 
     def run(self) -> DiagnosisResult:
-        """Execute the diagnosis loop. Returns a DiagnosisResult."""
+        """Execute the diagnosis loop. Returns a DiagnosisResult.
+
+        Side effect: writes a diagnosis transcript to
+        ``{archive_dir}/diagnosis/diagnosis_{N}.json`` where N is the
+        next sequential index, so repeat invocations don't overwrite.
+        The transcript contains the full message history + tool call
+        detail + cost + stop reason. Persisted EVEN when lessons.md is
+        not written — that's the whole point (debug failure modes).
+        """
         result = DiagnosisResult()
+        # Pre-compute an archive summary so the LLM doesn't need to
+        # waste turns on exploration. This was the #1 failure mode in
+        # the first real-LLM A/B run — gpt-4.1-mini burned 10-15 turns
+        # on search_files before even attempting write_lessons.
+        archive_summary = self._build_archive_summary()
         messages = [
             {
                 "role": "system",
-                "content": _DIAGNOSIS_SYSTEM_PROMPT.format(archive_dir=str(self.archive_dir)),
+                "content": _DIAGNOSIS_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
                 "content": (
-                    f"Analyze the optimization archive at {self.archive_dir} and "
-                    f"write a lessons.md file. You have at most {self.max_turns} "
-                    f"turns and a ${self.max_cost_usd:.2f} budget."
+                    f"# Archive summary\n\n{archive_summary}\n\n"
+                    f"# Your task\n\n"
+                    f"Based on the summary above, call `write_lessons` with a "
+                    f"markdown document following the three-section format. "
+                    f"Do not explore the archive unless you need one specific "
+                    f"quote. Budget: {self.max_turns} turns, "
+                    f"${self.max_cost_usd:.2f}."
                 ),
             },
         ]
@@ -228,7 +236,157 @@ class DiagnosisAgent:
 
         if self.lessons_path.exists():
             result.lessons_path = self.lessons_path
+
+        # Persist the full transcript ALWAYS — whether lessons.md was
+        # written or not. This is load-bearing for debugging diagnosis
+        # failures without re-running (which costs real LLM money).
+        try:
+            self._persist_transcript(messages, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Transcript persistence failed: %s", exc)
+
         return result
+
+    def _build_archive_summary(self) -> str:
+        """Walk the archive and build a compact text summary for the LLM.
+
+        Format (deterministic, ~1-3 KB per iteration):
+
+            ## manifest
+            {key fields from manifest.json}
+
+            ## iteration_000
+            candidate (first 600 chars): ...
+            scores: n=N, min=X, max=Y, mean=Z
+            tasks:
+              - task_00001 (score=0.42): task_input="..."
+              - task_00002 (score=0.91): task_input="..."
+            lowest 2:
+              task_00003 score=0.12 — agent_output preview: "..."
+              task_00004 score=0.18 — agent_output preview: "..."
+
+        Each iteration is limited so even 20 iterations × 50 tasks fit
+        in a reasonable prompt budget (~40-80 KB total).
+        """
+        lines: list[str] = []
+
+        # Manifest
+        manifest_path = self.archive_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                lines.append("## manifest")
+                for k in ("artifact_name", "created_at", "schema_version"):
+                    if k in manifest:
+                        lines.append(f"  {k}: {manifest[k]}")
+                lines.append("")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Iterations
+        iter_dirs = sorted(
+            p for p in self.archive_dir.iterdir()
+            if p.is_dir() and p.name.startswith("iteration_")
+        )
+        if not iter_dirs:
+            lines.append("(No iterations present yet — archive is empty.)")
+            return "\n".join(lines)
+
+        for iter_dir in iter_dirs:
+            lines.append(f"## {iter_dir.name}")
+
+            # Candidate
+            candidate_path = iter_dir / "candidate.txt"
+            if candidate_path.exists():
+                try:
+                    ctext = candidate_path.read_text(encoding="utf-8", errors="replace")
+                    # Cap at 600 chars so the composite doesn't dominate
+                    preview = ctext[:600]
+                    if len(ctext) > 600:
+                        preview += f"... [+{len(ctext) - 600} chars]"
+                    # Indent so markdown renders it as a block
+                    indented = "\n".join("    " + line for line in preview.split("\n"))
+                    lines.append("candidate:")
+                    lines.append(indented)
+                except Exception:  # noqa: BLE001
+                    lines.append("candidate: (unreadable)")
+
+            # Task score stats
+            tasks_dir = iter_dir / "tasks"
+            task_files = sorted(tasks_dir.glob("*.json")) if tasks_dir.exists() else []
+            if not task_files:
+                lines.append("tasks: (none)")
+                lines.append("")
+                continue
+
+            scored: list[tuple[float, str, dict]] = []  # (score, task_id, trace)
+            for tf in task_files:
+                try:
+                    trace = json.loads(tf.read_text(encoding="utf-8"))
+                    score = float(trace.get("score", 0.0) or 0.0)
+                    scored.append((score, tf.stem, trace))
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if scored:
+                scores_only = [s for s, _, _ in scored]
+                n = len(scores_only)
+                mean = sum(scores_only) / n
+                lines.append(f"scores: n={n}, min={min(scores_only):.3f}, max={max(scores_only):.3f}, mean={mean:.3f}")
+
+                # One-line per task with score + task_input preview
+                lines.append("tasks:")
+                for sc, tid, trace in scored:
+                    ti = str(trace.get("task_input", ""))[:100]
+                    lines.append(f'  - {tid} (score={sc:.3f}): "{ti}"')
+
+                # Lowest 2 with agent_output preview so the LLM can
+                # see WHY they failed without calling read_file
+                lowest = sorted(scored, key=lambda t: t[0])[:2]
+                if lowest:
+                    lines.append("lowest scoring (with agent_output preview):")
+                    for sc, tid, trace in lowest:
+                        ao = str(trace.get("agent_output", ""))[:300]
+                        lines.append(f'  {tid} (score={sc:.3f})')
+                        lines.append(f'    expected: {str(trace.get("expected_behavior", ""))[:150]}')
+                        lines.append(f'    actual:   {ao}')
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _persist_transcript(self, messages: list[dict], result: DiagnosisResult) -> None:
+        """Write a full diagnosis transcript to the archive for debugging.
+
+        File name: diagnosis/diagnosis_{N:03d}.json, with N incremented
+        sequentially so repeat invocations don't overwrite prior runs.
+        """
+        diag_dir = self.archive_dir / "diagnosis"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find the next available index
+        existing = sorted(diag_dir.glob("diagnosis_*.json"))
+        next_idx = len(existing)
+        path = diag_dir / f"diagnosis_{next_idx:03d}.json"
+
+        payload = {
+            "archive_dir": str(self.archive_dir),
+            "model_name": self.model_name,
+            "max_turns": self.max_turns,
+            "max_cost_usd": self.max_cost_usd,
+            "temperature": self.temperature,
+            "stop_reason": result.stop_reason,
+            "turns_used": result.turns_used,
+            "total_cost_usd": result.total_cost_usd,
+            "error": result.error,
+            "lessons_written": result.lessons_path is not None,
+            "tool_calls": result.tool_calls,  # name + args_preview + output_preview
+            "messages": messages,  # full conversation including system + tool results
+            "persisted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
 
     # ── LLM call ───────────────────────────────────────────────────────
 
