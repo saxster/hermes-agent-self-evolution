@@ -492,10 +492,39 @@ def evolve(
 
     if not all_pass:
         console.print("[red]✗ Evolved description FAILED constraints — not deploying[/red]")
-        output_path = Path("output") / "tools" / tool_name / "evolved_FAILED.txt"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(evolved_desc)
-        console.print(f"  Saved failed variant to {output_path}")
+        # Save failed variant separately for manual inspection
+        failed_path = Path("output") / "tools" / tool_name / "evolved_FAILED.txt"
+        failed_path.parent.mkdir(parents=True, exist_ok=True)
+        failed_path.write_text(evolved_desc)
+        console.print(f"  Saved failed variant to {failed_path}")
+
+        # Write metrics.json even on failure, so downstream tooling
+        # (multi-seed A/B runners, dashboards) sees the failure instead
+        # of silently falling back to stale data. See memory
+        # `reference_evolution_constraint_failure_data_loss.md`.
+        (output_dir / "evolved_description.txt").write_text(evolved_desc)
+        (output_dir / "baseline_description.txt").write_text(original_desc)
+        metrics = {
+            "tool_name": tool_name,
+            "timestamp": run_timestamp,
+            "iterations": iterations,
+            "optimizer_model": optimizer_model,
+            "eval_model": eval_model,
+            "baseline_score": None,
+            "evolved_score": None,
+            "improvement": None,
+            "baseline_size": len(original_desc),
+            "evolved_size": len(evolved_desc),
+            "elapsed_seconds": elapsed,
+            "constraints_passed": False,
+            "constraint_failures": [
+                {"name": c.constraint_name, "message": c.message}
+                for c in evolved_constraints
+                if not c.passed
+            ],
+        }
+        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        console.print(f"  Metrics written to {output_dir}/metrics.json (constraints_passed=False)")
         return
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────

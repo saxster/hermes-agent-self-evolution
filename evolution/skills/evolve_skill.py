@@ -159,6 +159,15 @@ def evolve(
     trainset = dataset.to_dspy_examples("train")
     valset = dataset.to_dspy_examples("val")
 
+    # Create the output dir NOW (not after optimization) so the
+    # constraint-failure path can write metrics.json into it. See
+    # memory `reference_evolution_constraint_failure_data_loss.md` —
+    # without this, downstream multi-seed A/B runners reading
+    # "latest metrics.json by mtime" silently fall back to stale data.
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path("output") / skill_name / run_timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # ── 5. Run GEPA optimization ────────────────────────────────────────
     console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
 
@@ -228,11 +237,40 @@ def evolve(
 
     if not all_pass:
         console.print("[red]✗ Evolved skill FAILED constraints — not deploying[/red]")
-        # Still save for inspection
-        output_path = Path("output") / skill_name / "evolved_FAILED.md"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(evolved_full)
-        console.print(f"  Saved failed variant to {output_path}")
+        # Save failed variant separately for manual inspection
+        failed_path = Path("output") / skill_name / "evolved_FAILED.md"
+        failed_path.parent.mkdir(parents=True, exist_ok=True)
+        failed_path.write_text(evolved_full)
+        console.print(f"  Saved failed variant to {failed_path}")
+
+        # IMPORTANT: write metrics.json into the run directory even on
+        # constraint failure, so downstream tooling (multi-seed A/B
+        # runners, dashboards) sees the failure instead of silently
+        # falling back to stale data. See memory
+        # `reference_evolution_constraint_failure_data_loss.md`.
+        (output_dir / "evolved_skill.md").write_text(evolved_full)
+        (output_dir / "baseline_skill.md").write_text(skill["raw"])
+        metrics = {
+            "skill_name": skill_name,
+            "timestamp": run_timestamp,
+            "iterations": iterations,
+            "optimizer_model": optimizer_model,
+            "eval_model": eval_model,
+            "baseline_score": None,
+            "evolved_score": None,
+            "improvement": None,
+            "baseline_size": len(skill["body"]),
+            "evolved_size": len(evolved_body),
+            "elapsed_seconds": elapsed,
+            "constraints_passed": False,
+            "constraint_failures": [
+                {"name": c.constraint_name, "message": c.message}
+                for c in evolved_constraints
+                if not c.passed
+            ],
+        }
+        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        console.print(f"  Metrics written to {output_dir}/metrics.json (constraints_passed=False)")
         return
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
@@ -284,20 +322,15 @@ def evolve(
     console.print(table)
 
     # ── 10. Save output ─────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("output") / skill_name / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save evolved skill
+    # output_dir was created before GEPA ran so the constraint-failure
+    # path could stream into it; reuse the same directory here.
     (output_dir / "evolved_skill.md").write_text(evolved_full)
-
-    # Save baseline for comparison
     (output_dir / "baseline_skill.md").write_text(skill["raw"])
 
     # Save metrics
     metrics = {
         "skill_name": skill_name,
-        "timestamp": timestamp,
+        "timestamp": run_timestamp,
         "iterations": iterations,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,
