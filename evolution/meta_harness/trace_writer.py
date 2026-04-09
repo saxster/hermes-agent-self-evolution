@@ -57,9 +57,18 @@ _ENV_ENABLED = "HERMES_EVOLUTION_TRACING"
 # a marker. 50 KB × ~50 tasks × ~10 iterations ≈ 25 MB per run — tiny.
 _DEFAULT_MAX_TASK_BYTES = 50_000
 
-# Thread-local storage for the currently active writer. Each evolution
-# run sets its own writer at the start of GEPA compilation.
-_tls = threading.local()
+# Module-level global for the active writer. Used to be thread-local,
+# but DSPy optimizers (GEPA, MIPROv2) run evaluation in worker threads
+# via dspy.utils.parallelizer.ParallelExecutor — thread-local state
+# does not propagate to those workers, which caused set_candidate()
+# calls from inside module.forward() to silently become no-ops.
+#
+# A process-global writer means concurrent evolve_prompt + evolve_tool_desc
+# runs in the SAME Python process would collide. Not a real use case
+# for the CLI (each invocation is its own subprocess), and the module
+# docstring warns against it.
+_writer_lock = threading.Lock()
+_active_writer_ref: Optional["TraceWriter"] = None
 
 
 def tracing_enabled() -> bool:
@@ -220,17 +229,25 @@ class TraceWriter:
             return self._task_counter
 
 
-# ── Thread-local active writer ─────────────────────────────────────────
+# ── Active writer (process-global) ─────────────────────────────────────
 
 
-def get_active_writer() -> Optional[TraceWriter]:
-    """Return the writer set for this thread, or None."""
-    return getattr(_tls, "writer", None)
+def get_active_writer() -> Optional["TraceWriter"]:
+    """Return the currently-active writer, or None."""
+    with _writer_lock:
+        return _active_writer_ref
 
 
-def set_active_writer(writer: Optional[TraceWriter]) -> None:
-    """Install (or clear) the writer for the current thread."""
-    _tls.writer = writer
+def set_active_writer(writer: Optional["TraceWriter"]) -> None:
+    """Install (or clear) the active writer.
+
+    Process-global by design — DSPy's ParallelExecutor runs module.forward()
+    in worker threads that don't see thread-local state. A global with a
+    lock lets the forward() hook reach the writer from any thread.
+    """
+    global _active_writer_ref
+    with _writer_lock:
+        _active_writer_ref = writer
 
 
 # ── Metric wrapping ────────────────────────────────────────────────────

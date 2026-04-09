@@ -57,13 +57,34 @@ def test_writer_creates_archive_and_manifest(tmp_path: Path):
     assert manifest["schema_version"] == 1
 
 
-def test_active_writer_is_thread_local(tmp_path: Path):
+def test_active_writer_set_and_clear(tmp_path: Path):
     assert get_active_writer() is None
     writer = TraceWriter(tmp_path / "t")
     set_active_writer(writer)
     assert get_active_writer() is writer
     set_active_writer(None)
     assert get_active_writer() is None
+
+
+def test_active_writer_visible_across_threads(tmp_path: Path):
+    """Critical regression test: DSPy optimizers run in worker threads,
+    so the active writer must be a process-global, not thread-local."""
+    import threading
+
+    writer = TraceWriter(tmp_path / "cross_thread")
+    set_active_writer(writer)
+
+    seen: list = []
+    def worker():
+        seen.append(get_active_writer())
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+
+    assert len(seen) == 1
+    assert seen[0] is writer, "writer must be visible from worker threads"
+    set_active_writer(None)
 
 
 # ── Per-task logging ───────────────────────────────────────────────────

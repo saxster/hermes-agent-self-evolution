@@ -241,6 +241,8 @@ class ToolDescModule(dspy.Module):
     def forward(self, task_input: str, available_tools: str = "") -> dspy.Prediction:
         # Meta-harness hook: if a trace writer is active, tell it which
         # candidate description produced this prediction. No-op otherwise.
+        # Hash both description_text AND predictor instructions because
+        # DSPy optimizers mutate the latter, not the former.
         prior_lessons = ""
         try:
             from evolution.meta_harness.trace_writer import (
@@ -249,7 +251,15 @@ class ToolDescModule(dspy.Module):
             )
             _writer = get_active_writer()
             if _writer is not None:
-                _writer.set_candidate(self.description_text)
+                try:
+                    _instr = self.predictor.predict.signature.instructions or ""
+                except Exception:  # pragma: no cover
+                    _instr = ""
+                _composite = (
+                    f"description_text:\n{self.description_text}\n\n"
+                    f"predictor_instructions:\n{_instr}"
+                )
+                _writer.set_candidate(_composite)
             prior_lessons = get_active_lessons()
         except Exception:  # pragma: no cover — never block optimization
             prior_lessons = ""

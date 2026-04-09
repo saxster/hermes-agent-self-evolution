@@ -59,7 +59,12 @@ def test_prompt_section_module_forward_calls_set_candidate(tmp_path: Path):
     )
     candidate_file = tmp_path / "traces" / "iteration_000" / "candidate.txt"
     assert candidate_file.exists()
-    assert candidate_file.read_text() == "CANDIDATE TEXT V1"
+    # Candidate is a composite "section_text:\n...\n\npredictor_instructions:\n..."
+    # so we check containment rather than equality.
+    content = candidate_file.read_text()
+    assert "CANDIDATE TEXT V1" in content
+    assert "section_text:" in content
+    assert "predictor_instructions:" in content
 
 
 def test_prompt_module_candidate_change_advances_iteration(tmp_path: Path):
@@ -78,8 +83,10 @@ def test_prompt_module_candidate_change_advances_iteration(tmp_path: Path):
     module_b.forward(task_input="task 2")
     writer.log_eval(SimpleNamespace(task_input="t2", expected_behavior="e"), SimpleNamespace(output="o2"), 0.8)
 
-    assert (tmp_path / "traces" / "iteration_000" / "candidate.txt").read_text() == "VERSION A"
-    assert (tmp_path / "traces" / "iteration_001" / "candidate.txt").read_text() == "VERSION B"
+    iter0_content = (tmp_path / "traces" / "iteration_000" / "candidate.txt").read_text()
+    iter1_content = (tmp_path / "traces" / "iteration_001" / "candidate.txt").read_text()
+    assert "VERSION A" in iter0_content
+    assert "VERSION B" in iter1_content
 
 
 def test_tool_desc_module_forward_calls_set_candidate(tmp_path: Path):
@@ -101,7 +108,10 @@ def test_tool_desc_module_forward_calls_set_candidate(tmp_path: Path):
     )
     candidate_file = tmp_path / "traces" / "iteration_000" / "candidate.txt"
     assert candidate_file.exists()
-    assert candidate_file.read_text() == "search the web for a query string"
+    content = candidate_file.read_text()
+    assert "search the web for a query string" in content
+    assert "description_text:" in content
+    assert "predictor_instructions:" in content
 
 
 def test_forward_hook_is_no_op_without_writer(tmp_path: Path):
@@ -147,4 +157,7 @@ def test_wrapped_metric_plus_forward_writes_full_trace(tmp_path: Path):
     assert trace["agent_output"] == "stubbed response"
     assert trace["score"] == 0.73
     assert trace["category"] == "analysis"
-    assert trace["candidate_chars"] == len("Act as a terse analyst.")
+    # candidate_chars now reflects the composite (section_text + instructions),
+    # which is longer than section_text alone — just assert it's >= that size.
+    assert trace["candidate_chars"] >= len("Act as a terse analyst.")
+    assert trace["candidate_preview"].startswith("section_text:")
