@@ -19,6 +19,9 @@ datasets/**/*.json
 snapshots/
 *.pkl
 
+# Runtime output (ab tests, generated prompts)
+output/
+
 # IDE
 .idea/
 .vscode/
