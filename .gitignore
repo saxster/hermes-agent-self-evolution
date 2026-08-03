@@ -27,3 +27,6 @@ output/
 .vscode/
 *.swp
 *.swo
+
+# graphify tool output
+graphify-out/
